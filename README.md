@@ -1,59 +1,152 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# [Eloquent] whereDoesntHaveMorph('relation', '*') generates ungrouped OR
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+## Laravel Version
 
-## About Laravel
+12.39.0
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## PHP Version
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+8.4
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## Database Driver & Version
 
-## Learning Laravel
+postgreSQL 18
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework. You can also check out [Laravel Learn](https://laravel.com/learn), where you will be guided through building a modern Laravel application.
+## Description
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+When calling `whereDoesntHaveMorph('relation', '*')` on a nullable morphTo relationship, Eloquent adds an OR ... IS NULL
+to include “no morph assigned” rows.
+Currently, that OR is appended outside the grouped relation clause.
+This produces ungrouped SQL, so prior or subsequent where conditions are not consistently applied depending on ordering,
+due to SQL operator precedence.
+The result set can be wider than intended.
 
-## Laravel Sponsors
+Imagine a model `Notification` with a nullable morphTo notifiable to `Video` and `Post`, plus a boolean column
+`is_urgent`.
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+Query 1:
 
-### Premium Partners
+```
+App\Models\Notification::where('is_urgent', false)
+    ->whereDoesntHaveMorph('notifiable', '*')
+    ->toRawSql();
+```
 
-- **[Vehikl](https://vehikl.com)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Redberry](https://redberry.international/laravel-development)**
-- **[Active Logic](https://activelogic.com)**
+Produces SQL similar to:
 
-## Contributing
+```
+select * from "notifications" 
+where 
+"is_urgent" = 0 
+and (
+    ("notifications"."notifiable_type" = 'App\Models\Video' and not exists (select * from "videos" where "notifications"."notifiable_id" = "videos"."id")) 
+    or ("notifications"."notifiable_type" = 'App\Models\Post' and not exists (select * from "posts" where "notifications"."notifiable_id" = "posts"."id"))
+) 
+or "notifications"."notifiable_type" is null
+```
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+Query 2:
 
-## Code of Conduct
+```
+App\Models\Notification::whereDoesntHaveMorph('notifiable', '*')
+    ->where('is_urgent', false)
+    ->toRawSql();
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+Produces:
 
-## Security Vulnerabilities
+```
+select * from "notifications" 
+where 
+(
+    ("notifications"."notifiable_type" = 'App\Models\Video' and not exists (select * from "videos" where "notifications"."notifiable_id" = "videos"."id")) 
+    or ("notifications"."notifiable_type" = 'App\Models\Post' and not exists (select * from "posts" where "notifications"."notifiable_id" = "posts"."id"))
+) 
+or "notifications"."notifiable_type" is null 
+and "is_urgent" = 0"
+```
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+These two queries return different results even though they are logically meant to be equivalent.
 
-## License
+### Expected Behavior
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+The OR for the “no morph assigned” case (IS NULL) should be grouped together with the other per-type relation branches,
+so it does not escape the relation condition group.
+Both examples above should instead produce:
+
+```
+...
+and (
+  ("notifications"."notifiable_type" = 'App\Models\Video' and not exists (select * from "videos" where "notifications"."notifiable_id" = "videos"."id")) 
+  or ("notifications"."notifiable_type" = 'App\Models\Post' and not exists (select * from "posts" where "notifications"."notifiable_id" = "posts"."id"))
+  or "notifications"."notifiable_type" is null
+)
+```
+
+### Actual behavior
+
+The OR ... IS NULL is currently appended outside the grouping of the relation branches, which changes how
+prior/subsequent where conditions bind and leads to inconsistent results.
+
+### Code location and root cause
+
+- File: `src/Illuminate/Database/Eloquent/Concerns/QueriesRelationships.php`
+- Method: `hasMorph()`
+
+#### Problem
+
+- The per-type branches are correctly grouped inside a where(...) closure.
+- The extra branch that handles the “null morph” case is appended afterwards.
+
+## Steps to reproduce
+
+A minimal reproduction repository is available here:
+
+[Repo: [Eloquent] whereDoesntHaveMorph('relation', '*') generates ungrouped OR](https://github.com/hannrei/laravel-12-wheredoesnthavemorph-or-bug)
+
+- Clone the repository and set it up. (see README)
+- Open Tinker and execute the example queries to compare the generated SQL.
+
+## Setup
+
+0. Requirements
+
+- Git
+- Docker
+- Composer
+
+1. Clone the repository
+
+    ```
+   git clone git@github.com:hannrei/laravel-12-wheredoesnthavemorph-or-bug.git
+    ```
+
+2. Copy the `.env.example` file to `.env` by
+
+    ```
+    cp .env.example .env
+    ```
+
+3. Install dependencies by
+
+    ```
+    composer install
+    ```
+
+3. Start the application by
+
+    ```
+    ./vendor/bin/sail up -d
+    ```
+
+4. Generate app key with
+
+   ```
+   ./vendor/bin/sail artisan key:generate
+   ```
+
+5. Run
+
+    ```
+    ./vendor/bin/sail artisan migrate:fresh --seed
+    ```
